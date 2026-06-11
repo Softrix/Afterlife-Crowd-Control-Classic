@@ -1,0 +1,27 @@
+## Interface: 20505, 50503
+## Version: 2026.1.0.1.1
+## Title: |TInterface\AddOns\Afterlife\assets\graphics\Afterlife:0|t|cffffd200 Afterlife Crowd Control|r
+## Author: Michael Boyle a.k.a. Codermik
+## Notes: Crowd control monitoring for solo play, party and raids. Supports TBC Classic and Mists of Pandaria Classic.
+## SavedVariables: AfterlifeGlobalSettings
+## SavedVariablesPerCharacter: AfterlifeCharacterSettings
+## X-Category: Combat
+## X-eMail: michael.boyle@softrix.co.uk
+## X-Website: www.twitch.tv/codermik
+
+locales\enUS.lua
+locales\deDE.lua
+locales\esES.lua
+locales\frFR.lua
+locales\ruRU.lua
+locales\zhCN.lua
+locales\zhTW.lua
+
+lib\embed.xml
+spells.lua
+pvpSounds.lua
+core.lua
+3dframe.lua
+popup.lua
+borderflash.lua
+options.lua
