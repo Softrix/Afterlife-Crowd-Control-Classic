@@ -8,8 +8,8 @@ local addonName, addonTable = ...
 Afterlife = addonTable
 AfterlifeGlobalSettings = AfterlifeGlobalSettings or {}
 AfterlifeCharacterSettings = AfterlifeCharacterSettings or {}
-local ADDON_VERSION = "2026.1.0.1.1"
-local ADDON_DATE = "9th June 2026"
+local ADDON_VERSION = "2026.31.0.1.1"
+local ADDON_DATE = "12th June 2026"
 
 --- Resolves a localized string by key, with optional format arguments.
 --- @param key string locale key
@@ -67,6 +67,7 @@ local SOUND_APPLIED = "Interface\\AddOns\\Afterlife\\assets\\sounds\\applied.ogg
 local SOUND_RENEWED = "Interface\\AddOns\\Afterlife\\assets\\sounds\\renewed.ogg"
 local SOUND_BREAK = "Interface\\AddOns\\Afterlife\\assets\\sounds\\ccbreak.ogg"
 local SOUNDS_ROOT = "Interface\\AddOns\\Afterlife\\assets\\sounds\\"
+local DR_ICON = "Interface\\AddOns\\Afterlife\\assets\\graphics\\dr.tga"
 local LOCALE_SOUND_FALLBACK = "enUS"
 local LOCALE_SOUND_FOLDERS = {
 	enUS = true, deDE = true, esES = true, frFR = true, ruRU = true, zhCN = true, zhTW = true,
@@ -104,6 +105,10 @@ local targetGuid
 local focusGuid
 local ccReady = false
 local pendingCast3DUnit = nil
+local IsTrapActive
+local IsCastPreview3DActive
+local CanClearOwn3DFrame
+local ClearCastPreview3D
 
 local AfterlifeDiminishTimers = {}
 local AfterlifeTrapTimers = {}
@@ -706,11 +711,9 @@ function Afterlife:RemoveCC(timerId, silent)
 	AfterlifeControlledCC[timerId] = nil
 	ClearCCCountdownSound(timerId)
 	StopCCTimerBar(timerId)
-	if not silent and entry.casterGuid == playerGUID then
-		if not Afterlife:GetCCByCaster(playerGUID) then
-			if Afterlife.Clear3DFrame then
-				Afterlife:Clear3DFrame()
-			end
+	if not silent and entry.casterGuid == playerGUID and CanClearOwn3DFrame() then
+		if Afterlife.Clear3DFrame then
+			Afterlife:Clear3DFrame()
 		end
 	end
 	return entry
@@ -726,7 +729,7 @@ function Afterlife:RemoveCCByMob(mobGuid)
 			removed[#removed + 1] = self:RemoveCC(timerId, true)
 		end
 	end
-	if not self:GetCCByCaster(playerGUID) and Afterlife.Clear3DFrame then
+	if CanClearOwn3DFrame() and Afterlife.Clear3DFrame then
 		Afterlife:Clear3DFrame()
 	end
 	return removed
@@ -740,21 +743,27 @@ function Afterlife:RemoveCCByCaster(casterGuid)
 			self:RemoveCC(timerId, true)
 		end
 	end
-	if casterGuid == playerGUID and Afterlife.Clear3DFrame then
-		Afterlife:Clear3DFrame()
+	if casterGuid == playerGUID then
+		pendingCast3DUnit = nil
+		if Afterlife.Clear3DFrame then
+			Afterlife:Clear3DFrame()
+		end
 	end
 end
 
---- Removes expired CC entries and triggers own-CC-break handling when applicable.
+--- Removes expired CC entries and triggers DR and own-CC-break handling when applicable.
 function Afterlife:PurgeExpiredCC()
 	for timerId, entry in pairs(AfterlifeControlledCC) do
 		if self:GetCCRemaining(entry) <= 0 then
 			local wasOwn = entry.casterGuid == playerGUID
 			local removed = self:RemoveCC(timerId, true)
-			if wasOwn and removed and HandleOwnCCBreak then
-				HandleOwnCCBreak(removed, nil, nil, false)
-				if not self:GetCCByCaster(playerGUID) and Afterlife.Clear3DFrame then
-					Afterlife:Clear3DFrame()
+			if removed then
+				Afterlife:DRTimerOnBreak(removed.mobGuid, removed)
+				if wasOwn and HandleOwnCCBreak then
+					HandleOwnCCBreak(removed, nil, nil, false)
+					if CanClearOwn3DFrame() and Afterlife.Clear3DFrame then
+						Afterlife:Clear3DFrame()
+					end
 				end
 			end
 		end
@@ -769,7 +778,7 @@ local function AnnounceToChat(msg)
 	end
 	local channel = GetAnnounceChatChannel()
 	if channel ~= "SOLO" then
-		SendChatMessage(L("CHAT_HEADER") .. msg, channel)
+		SendChatMessage(msg, channel)
 	else
 		DEFAULT_CHAT_FRAME:AddMessage(L("CHAT_TITLE_SHORT") .. msg)
 	end
@@ -1032,30 +1041,79 @@ HandleOwnCCBreak = function(entry, breakerName, breakerSpellId, fromSync)
 	end
 end
 
+--- Starts or refreshes the DR cooldown bar for a tracked player target.
+--- @param drEntry table DR tracking entry with mobGuid, mobName, and icon
+--- @return boolean true if the bar was started
+function Afterlife:StartDRTimerBar(drEntry)
+	if not drEntry or drEntry.mobGuid == playerGUID then
+		return false
+	end
+	local NT = self.NaturTimers
+	if not NT then
+		return false
+	end
+	self:EnsureTimerGroups()
+	local opts = {
+		label = (drEntry.mobName or "Unknown") .. " (DR)",
+		reverse = true,
+		iconLeft = DR_ICON,
+	}
+	if drEntry.raidIconIndex and drEntry.raidIconIndex > 0 and AfterlifeGlobalSettings.showRaidIcons ~= false then
+		opts.iconRight = RAID_ICON_PATHS[drEntry.raidIconIndex]
+	end
+	NT:StartTimer(CC_GROUP, self:MakeDRTimerId(drEntry.mobGuid), DR_WINDOW, opts)
+	return true
+end
+
 --- Applies diminish returns to spell duration and tracks DR state for a mob.
 --- @param mobGuid string target unit GUID
 --- @param mobName string target display name
 --- @param spellDuration number base CC duration in seconds
 --- @param spellIcon string|nil spell icon file path
 --- @param raidIconIndex number|nil raid target icon index for the mob
+--- @param isRefresh boolean|nil when true, halve duration and start or refresh the DR bar
 --- @return number effective duration after DR halving, if applicable
-function Afterlife:UpdateDRDuration(mobGuid, mobName, spellDuration, spellIcon, raidIconIndex)
+function Afterlife:UpdateDRDuration(mobGuid, mobName, spellDuration, spellIcon, raidIconIndex, isRefresh)
 	if mobGuid == playerGUID then
 		return spellDuration
 	end
 	self:PurgeExpiredDR()
 	for _, value in ipairs(AfterlifeDiminishTimers) do
 		if value.mobGuid == mobGuid then
-			local halved = value.duration / 2
-			value.duration = halved
-			value.lastDRTime = GetTime()
-			return halved
+			if isRefresh or value.lastDRTime then
+				local halved = value.duration / 2
+				value.duration = halved
+				value.mobName = mobName or value.mobName
+				value.icon = spellIcon or value.icon
+				value.raidIconIndex = raidIconIndex or value.raidIconIndex
+				value.lastDRTime = GetTime()
+				self:StartDRTimerBar(value)
+				return halved
+			end
+			value.mobName = mobName or value.mobName
+			value.icon = spellIcon or value.icon
+			value.raidIconIndex = raidIconIndex or value.raidIconIndex
+			return spellDuration
 		end
+	end
+	if isRefresh then
+		local halved = spellDuration / 2
+		local drEntry = {
+			mobGuid = mobGuid,
+			mobName = mobName,
+			lastDRTime = GetTime(),
+			duration = halved,
+			icon = spellIcon,
+			raidIconIndex = raidIconIndex or 0,
+		}
+		AfterlifeDiminishTimers[#AfterlifeDiminishTimers + 1] = drEntry
+		self:StartDRTimerBar(drEntry)
+		return halved
 	end
 	AfterlifeDiminishTimers[#AfterlifeDiminishTimers + 1] = {
 		mobGuid = mobGuid,
 		mobName = mobName,
-		lastDRTime = GetTime(),
+		lastDRTime = nil,
 		duration = spellDuration,
 		icon = spellIcon,
 		raidIconIndex = raidIconIndex or 0,
@@ -1063,36 +1121,52 @@ function Afterlife:UpdateDRDuration(mobGuid, mobName, spellDuration, spellIcon, 
 	return spellDuration
 end
 
---- Starts a DR cooldown timer bar when CC on a mob breaks.
+--- Starts a DR cooldown timer bar when CC on a player ends.
 --- @param mobGuid string target unit GUID
-function Afterlife:DRTimerOnBreak(mobGuid)
-	if mobGuid == playerGUID then
+--- @param ccEntry table|nil ended CC entry used to bootstrap DR tracking if missing
+function Afterlife:DRTimerOnBreak(mobGuid, ccEntry)
+	if mobGuid == playerGUID or not IsPlayerGuid(mobGuid) then
 		return
 	end
-	local NT = self.NaturTimers
-	if not NT then
-		return
-	end
+
+	local drEntry
 	for _, value in ipairs(AfterlifeDiminishTimers) do
 		if value.mobGuid == mobGuid then
-			value.lastDRTime = GetTime()
-			self:EnsureTimerGroups()
-			NT:StartTimer(CC_GROUP, self:MakeDRTimerId(value.mobGuid), DR_WINDOW, {
-				label = (value.mobName or "Unknown") .. " (DR)",
-				reverse = true,
-				iconLeft = value.icon,
-			})
-			return
+			drEntry = value
+			break
 		end
 	end
+
+	if not drEntry and ccEntry then
+		local entryData = Afterlife_GetCCSpell and Afterlife_GetCCSpell(ccEntry.spellId)
+		if entryData and entryData.diminishReturns then
+			drEntry = {
+				mobGuid = mobGuid,
+				mobName = ccEntry.mobName,
+				lastDRTime = nil,
+				duration = ccEntry.duration,
+				icon = ccEntry.icon,
+				raidIconIndex = ccEntry.raidIconIndex or 0,
+			}
+			AfterlifeDiminishTimers[#AfterlifeDiminishTimers + 1] = drEntry
+		end
+	end
+
+	if not drEntry then
+		return
+	end
+
+	drEntry.lastDRTime = GetTime()
+	self:StartDRTimerBar(drEntry)
 end
 
 --- Removes DR tracking entries and timer bars older than the DR window.
 function Afterlife:PurgeExpiredDR()
 	local NT = self.NaturTimers
+	local now = GetTime()
 	for i = #AfterlifeDiminishTimers, 1, -1 do
 		local value = AfterlifeDiminishTimers[i]
-		if GetTime() - value.lastDRTime > 17 then
+		if value.lastDRTime and now - value.lastDRTime >= DR_WINDOW then
 			if NT then
 				NT:StopTimer(CC_GROUP, Afterlife:MakeDRTimerId(value.mobGuid))
 			end
@@ -1141,7 +1215,7 @@ function Afterlife:PurgeExpiredTrapTimers()
 	for i = #AfterlifeTrapTimers, 1, -1 do
 		local trap = AfterlifeTrapTimers[i]
 		if GetTime() - trap.appliedAt > trap.duration then
-			if trap.casterGuid == playerGUID and Afterlife.Clear3DFrame then
+			if trap.casterGuid == playerGUID and CanClearOwn3DFrame() and Afterlife.Clear3DFrame then
 				Afterlife:Clear3DFrame()
 			end
 			StopCCTimerBar(trap.casterGuid)
@@ -1153,7 +1227,7 @@ end
 --- Returns whether a pending freezing trap timer exists for a caster.
 --- @param sourceGuid string hunter caster GUID
 --- @return boolean true if a trap is pending
-local function IsTrapActive(sourceGuid)
+IsTrapActive = function(sourceGuid)
 	for _, trap in ipairs(AfterlifeTrapTimers) do
 		if trap.casterGuid == sourceGuid then
 			return true
@@ -1179,6 +1253,35 @@ local function ResolveUnitTokenForGuid(mobGuid)
 		return "mouseover"
 	end
 	return nil
+end
+
+--- Returns whether a 3D cast preview is active for the current cast target.
+--- @return boolean
+IsCastPreview3DActive = function()
+	return pendingCast3DUnit ~= nil
+end
+
+--- Returns whether the 3D controlled-unit frame may be cleared.
+--- @return boolean
+CanClearOwn3DFrame = function()
+	if Afterlife:GetCCByCaster(playerGUID) or IsTrapActive(playerGUID) then
+		return false
+	end
+	if IsCastPreview3DActive() then
+		return false
+	end
+	return true
+end
+
+--- Hides the 3D frame when a cast preview is active and no CC or trap timer is running.
+ClearCastPreview3D = function()
+	if Afterlife:GetCCByCaster(playerGUID) or IsTrapActive(playerGUID) then
+		return
+	end
+	pendingCast3DUnit = nil
+	if Afterlife.Clear3DFrame then
+		Afterlife:Clear3DFrame()
+	end
 end
 
 --- Updates or shows the 3D controlled-unit frame for the player's own CC.
@@ -1280,7 +1383,8 @@ end
 --- @param spellName string crowd-control spell name
 --- @param destRaidFlags number COMBATLOG_OBJECT raid target flags
 --- @param fromSync boolean|nil true when processing a group sync message
-local function HandleCCApply(mobGuid, mobName, casterGuid, casterName, spellId, spellName, destRaidFlags, fromSync)
+--- @param isRefresh boolean|nil true when processing SPELL_AURA_REFRESH
+local function HandleCCApply(mobGuid, mobName, casterGuid, casterName, spellId, spellName, destRaidFlags, fromSync, isRefresh)
 	if not IsCCEnabled() then
 		return
 	end
@@ -1293,8 +1397,16 @@ local function HandleCCApply(mobGuid, mobName, casterGuid, casterName, spellId, 
 	end
 	local raidIndex, raidChat = GetRaidIconInfo(destRaidFlags)
 	duration = duration or entryData.duration
+	local timerId = Afterlife:MakeCCTimerId(mobGuid, spellId)
+	local existingEntry = AfterlifeControlledCC[timerId]
 	if entryData.diminishReturns and IsPlayerGuid(mobGuid) then
-		duration = Afterlife:UpdateDRDuration(mobGuid, mobName, duration, icon, raidIndex)
+		if isRefresh then
+			duration = Afterlife:UpdateDRDuration(mobGuid, mobName, duration, icon, raidIndex, true)
+		elseif existingEntry then
+			duration = existingEntry.duration
+		else
+			duration = Afterlife:UpdateDRDuration(mobGuid, mobName, duration, icon, raidIndex)
+		end
 	end
 	local entry, isRenewal = Afterlife:AddOrRenewCC(mobGuid, mobName, casterGuid, casterName, spellId, spellName, duration, {
 		breakable = entryData.breakable,
@@ -1324,7 +1436,8 @@ end
 --- @param spellName string crowd-control spell name
 --- @param destRaidFlags number COMBATLOG_OBJECT raid target flags
 --- @param fromSync boolean|nil true when processing a group sync message
-local function HandleInstantCC(mobGuid, mobName, casterGuid, casterName, spellId, spellName, destRaidFlags, fromSync)
+--- @param isRefresh boolean|nil true when processing SPELL_AURA_REFRESH
+local function HandleInstantCC(mobGuid, mobName, casterGuid, casterName, spellId, spellName, destRaidFlags, fromSync, isRefresh)
 	fromSync = fromSync and true or false
 	if not IsCCEnabled() or not mobGuid or not mobName or mobName == "" then
 		return
@@ -1334,8 +1447,16 @@ local function HandleInstantCC(mobGuid, mobName, casterGuid, casterName, spellId
 		return
 	end
 	local raidIndex, raidChat = GetRaidIconInfo(destRaidFlags)
+	local timerId = Afterlife:MakeCCTimerId(mobGuid, spellId)
+	local existingEntry = AfterlifeControlledCC[timerId]
 	if entryData.diminishReturns and IsPlayerGuid(mobGuid) then
-		duration = Afterlife:UpdateDRDuration(mobGuid, mobName, duration, icon, raidIndex)
+		if isRefresh then
+			duration = Afterlife:UpdateDRDuration(mobGuid, mobName, duration, icon, raidIndex, true)
+		elseif existingEntry then
+			duration = existingEntry.duration
+		else
+			duration = Afterlife:UpdateDRDuration(mobGuid, mobName, duration, icon, raidIndex)
+		end
 	end
 	local entry, isRenewal = Afterlife:AddOrRenewCC(mobGuid, mobName, casterGuid, casterName, spellId, spellName, duration, {
 		breakable = entryData.breakable,
@@ -1364,7 +1485,12 @@ end
 --- @param destRaidFlags number COMBATLOG_OBJECT raid target flags
 --- @param fromSync boolean|nil true when processing a group sync message
 local function HandleCCRefresh(mobGuid, mobName, casterGuid, casterName, spellId, spellName, destRaidFlags, fromSync)
-	HandleCCApply(mobGuid, mobName, casterGuid, casterName, spellId, spellName, destRaidFlags, fromSync)
+	local entryData = Afterlife_GetCCSpell and Afterlife_GetCCSpell(spellId)
+	if entryData and entryData.instant then
+		HandleInstantCC(mobGuid, mobName, casterGuid, casterName, spellId, spellName, destRaidFlags, fromSync, true)
+	else
+		HandleCCApply(mobGuid, mobName, casterGuid, casterName, spellId, spellName, destRaidFlags, fromSync, true)
+	end
 end
 
 --- Removes a CC entry on break/expiry and triggers DR and own-CC-break handling.
@@ -1390,11 +1516,11 @@ local function HandleCCBreak(mobGuid, spellId, breakerName, breakerSpellId, from
 	end
 	local wasOwn = entry.casterGuid == playerGUID
 	Afterlife:RemoveCC(timerId, true)
-	Afterlife:DRTimerOnBreak(mobGuid)
+	Afterlife:DRTimerOnBreak(mobGuid, entry)
 	if wasOwn then
 		HandleOwnCCBreak(entry, breakerName, breakerSpellId, fromSync)
 	end
-	if not Afterlife:GetCCByCaster(playerGUID) and Afterlife.Clear3DFrame then
+	if CanClearOwn3DFrame() and Afterlife.Clear3DFrame then
 		Afterlife:Clear3DFrame()
 	end
 end
@@ -1420,7 +1546,9 @@ local function HandleCCFromSync(cmd, mobGuid, mobName, casterGuid, casterName, s
 		return
 	end
 	local entryData = Afterlife_GetCCSpell(spellId)
-	if entryData and entryData.instant then
+	if cmd == "ACCR" then
+		HandleCCRefresh(mobGuid, mobName, casterGuid, casterName, spellId, spellName, tonumber(destRaidFlags) or 0, true)
+	elseif entryData and entryData.instant then
 		HandleInstantCC(mobGuid, mobName, casterGuid, casterName, spellId, spellName, tonumber(destRaidFlags) or 0, true)
 	else
 		HandleCCApply(mobGuid, mobName, casterGuid, casterName, spellId, spellName, tonumber(destRaidFlags) or 0, true)
@@ -1481,10 +1609,8 @@ local function ProcessCombatLog()
 	end
 
 	if subEvent == "SPELL_CAST_FAILED" then
-		if sourceGUID == playerGUID and not Afterlife:GetCCByCaster(playerGUID) and not IsTrapActive(playerGUID) and not pendingCast3DUnit then
-			if Afterlife.Clear3DFrame then
-				Afterlife:Clear3DFrame()
-			end
+		if sourceGUID == playerGUID and IsCastPreview3DActive() then
+			ClearCastPreview3D()
 		end
 		return
 	end
@@ -1548,12 +1674,15 @@ local function ProcessCombatLog()
 
 	if subEvent == "SPELL_MISSED" then
 		local missType = select(15, CombatLogGetCurrentEventInfo())
-		if sourceGUID == playerGUID and entryData and missType == "IMMUNE" and AfterlifeGlobalSettings.announceMyCCImmune then
-			local spellLink = GetSpellLink(spellId) or spellName
-			local targetLabel = destName or ""
-			AnnounceToChat(L("AFTERLIFE_FAILED", spellLink, targetLabel))
-			if AfterlifeGlobalSettings.graphicalPopups and Afterlife_ShowPopup then
-				Afterlife_ShowPopup("immune")
+		if sourceGUID == playerGUID and entryData then
+			ClearCastPreview3D()
+			if missType == "IMMUNE" and AfterlifeGlobalSettings.announceMyCCImmune then
+				local spellLink = GetSpellLink(spellId) or spellName
+				local targetLabel = destName or ""
+				AnnounceToChat(L("AFTERLIFE_FAILED", spellLink, targetLabel))
+				if AfterlifeGlobalSettings.graphicalPopups and Afterlife_ShowPopup then
+					Afterlife_ShowPopup("immune")
+				end
 			end
 		end
 		return
@@ -1606,16 +1735,16 @@ local function OnCCUpdate(_, elapsed)
 	if ownCC then
 		local remaining = Afterlife:GetCCRemaining(ownCC)
 		if remaining > 0 then
-			UpdateCCCountdownSounds(ownCC, remaining)
-			if Afterlife.Update3DCC then
-				Afterlife:Update3DCC(ownCC.mobName, remaining)
-			elseif Afterlife.Update3DFrame then
-				Afterlife:Update3DFrame(ownCC.mobName, remaining)
+			if not IsCastPreview3DActive() then
+				UpdateCCCountdownSounds(ownCC, remaining)
+				if Afterlife.Update3DCC then
+					Afterlife:Update3DCC(ownCC.mobName, remaining)
+				elseif Afterlife.Update3DFrame then
+					Afterlife:Update3DFrame(ownCC.mobName, remaining)
+				end
 			end
-		elseif not IsTrapActive(playerGUID) then
-			if Afterlife.Clear3DFrame then
-				Afterlife:Clear3DFrame()
-			end
+		elseif CanClearOwn3DFrame() and Afterlife.Clear3DFrame then
+			Afterlife:Clear3DFrame()
 		end
 	end
 

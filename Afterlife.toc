@@ -1,5 +1,5 @@
 ## Interface: 20505, 50503
-## Version: 2026.1.0.1.1
+## Version: 2026.31.0.1.1
 ## Title: |TInterface\AddOns\Afterlife\assets\graphics\Afterlife:0|t|cffffd200 Afterlife Crowd Control|r
 ## Author: Michael Boyle a.k.a. Codermik
 ## Notes: Crowd control monitoring for solo play, party and raids. Supports TBC Classic and Mists of Pandaria Classic.

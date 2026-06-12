@@ -82,7 +82,7 @@
 
 - enUS, deDE, esES, frFR, ruRU, zhCN, zhTW
 - UI strings, announce messages, options labels, load message
-- Locale-specific sound folders for countdown and break audio
+- Locale-specific sound folders for countdown and break audio - need to implement other languages, only english exists atm.
 
 ## Libraries & assets
 
@@ -95,3 +95,4 @@
 
 - **Immune popup** — only fires when **Announce Immune** is enabled (coupled to that option)
 - **3D frame with multiple own CCs** — casting CC on a second target while one is active changes the 3D target (`GetCCByCaster` returns one arbitrary entry); behaviour undecided
+
